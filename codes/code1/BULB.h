@@ -3,7 +3,7 @@
 
 #include <Arduino.h>
 #include "SMARTDEVICE.h"
-#include "LIGHTMODE.h"  // add this include
+#include "LIGHTMODE.h"  
 
 class Bulb : public SmartDevice {
   private:
@@ -12,7 +12,6 @@ class Bulb : public SmartDevice {
     const char* name;
 
   public:
-    // Notice we removed the "isLowLevelTrigger" stuff
     Bulb(int pinNumber, const char* deviceName) {
       pin = pinNumber;
       name = deviceName;
@@ -22,17 +21,15 @@ class Bulb : public SmartDevice {
       digitalWrite(pin, LOW); // Start OFF
     }
 
-    
+    void handleCommand(uint8_t cmdId, uint8_t payload) override {
+      if (currentLightMode != LightMode::MANUAL) return;  // locked out during AUTO
 
-void handleCommand(char cmd) override {
-  if (currentLightMode != LightMode::MANUAL) return;  // locked out during AUTO
-
-  if (cmd == 'A' && strcmp(name, "Bulb 1") == 0) {
-    toggle();
-  } else if (cmd == 'B' && strcmp(name, "Bulb 2") == 0) {
-    toggle();
-  }
-}
+      if (cmdId == 0x01 && strcmp(name, "Bulb 1") == 0) {
+        toggle();
+      } else if (cmdId == 0x02 && strcmp(name, "Bulb 2") == 0) {
+        toggle();
+      }
+    }
 
     void update() override {
       // Basic LEDs don't need continuous background updates

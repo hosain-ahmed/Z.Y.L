@@ -26,23 +26,23 @@ class OledDisplay : public SmartDevice {
       currentFrame = 0;
     }
 
-    void handleCommand(char cmd) override {
-      switch (cmd) {
-        case 'J': // enter TV mode, start playing
+    void handleCommand(uint8_t cmdId, uint8_t payload) override {
+      switch (cmdId) {
+        case 0x05: // CMD_TV_ON
           state = TVState::PLAYING;
           break;
-        case 'K': // exit TV mode
+        case 0x06: // CMD_TV_OFF
           state = TVState::OFF;
           showMessage("TV OFF");
           break;
-        case 'P': // play
+        case 0x07: // CMD_TV_PLAY
           if (state != TVState::OFF) state = TVState::PLAYING;
           break;
-        case 'Q': // pause
+        case 0x08: // CMD_TV_PAUSE
           if (state != TVState::OFF) state = TVState::PAUSED;
           break;
-        case 'N':
-        case 'M':
+        case 0x09: // CMD_TV_NEXT
+        case 0x0A: // CMD_TV_PREV
           if (state != TVState::OFF) {
             currentVideo = (currentVideo == 1) ? 2 : 1;
             currentFrame = 0;

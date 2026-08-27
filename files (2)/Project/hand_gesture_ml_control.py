@@ -117,6 +117,26 @@ MIN_CONFIDENCE = 0.6
 
 FAN_MAX_LEVEL = 3
 
+START_BYTE = 0xAA
+END_BYTE = 0xBB
+
+# Map your existing gesture->char logic to a byte identifier and default payload
+CMD_BULB1_TOGGLE = 0x01
+CMD_BULB2_TOGGLE = 0x02
+CMD_AUTO_ON      = 0x03
+CMD_AUTO_OFF     = 0x04
+CMD_TV_ON        = 0x05
+CMD_TV_OFF       = 0x06
+CMD_TV_PLAY      = 0x07
+CMD_TV_PAUSE     = 0x08
+CMD_TV_NEXT      = 0x09
+CMD_TV_PREV      = 0x0A
+CMD_FAN_SPEED    = 0x0B  # payload = 0-255 speed value
+
+def build_packet(cmd_id: int, payload: int = 0) -> bytes:
+    return bytes([START_BYTE, cmd_id, payload & 0xFF, END_BYTE])
+
+
 
 class SerialLink:
     def __init__(self, port, baud=115200, enabled=True):
@@ -161,49 +181,52 @@ def handle_shape(shape, state: AppState, link: SerialLink):
     if mode == "NORMAL":
         if shape == "OPEN_PALM":
             state.bulb1 = not state.bulb1
-            link.send(b"A")
+            link.send(build_packet(CMD_BULB1_TOGGLE))
             return "BULB1_TOGGLE"
         if shape == "FIST":
             state.bulb2 = not state.bulb2
-            link.send(b"B")
+            link.send(build_packet(CMD_BULB2_TOGGLE))
             return "BULB2_TOGGLE"
         if shape == "THUMBS_UP":
             state.fan_level = min(state.fan_level + 1, FAN_MAX_LEVEL)
-            link.send(b"C")
+            # Map 0-3 level to 0-255 PWM payload
+            pwm_val = int((state.fan_level / FAN_MAX_LEVEL) * 255)
+            link.send(build_packet(CMD_FAN_SPEED, pwm_val))
             return f"FAN_UP (level {state.fan_level})"
         if shape == "THUMBS_DOWN":
             state.fan_level = max(state.fan_level - 1, 0)
-            link.send(b"D")
+            pwm_val = int((state.fan_level / FAN_MAX_LEVEL) * 255)
+            link.send(build_packet(CMD_FAN_SPEED, pwm_val))
             return f"FAN_DOWN (level {state.fan_level})"
         if shape == "TWO":
             state.mode = "AUTO"
             state.bulb1 = False
             state.bulb2 = False
             state.fan_level = 0
-            link.send(b"H")
+            link.send(build_packet(CMD_AUTO_ON))
             return "AUTO_MODE_ENTER"
         if shape == "OK_SIGN":
             state.mode = "TV"
-            link.send(b"J")
+            link.send(build_packet(CMD_TV_ON))
             return "TV_MODE_ENTER"
         return None
 
     if mode == "TV":
         if shape == "OPEN_PALM":
-            link.send(b"P")
+            link.send(build_packet(CMD_TV_PLAY))
             return "TV_PLAY"
         if shape == "FIST":
-            link.send(b"Q")
+            link.send(build_packet(CMD_TV_PAUSE))
             return "TV_PAUSE"
         if shape == "THUMBS_UP":
-            link.send(b"N")
+            link.send(build_packet(CMD_TV_NEXT))
             return "TV_SKIP_FWD"
         if shape == "THUMBS_DOWN":
-            link.send(b"M")
+            link.send(build_packet(CMD_TV_PREV))
             return "TV_SKIP_BACK"
         if shape == "OK_SIGN":
             state.mode = "NORMAL"
-            link.send(b"K")
+            link.send(build_packet(CMD_TV_OFF))
             return "TV_MODE_EXIT"
         # TWO (peace sign) is inactive in TV mode per the gesture table
         return None
@@ -211,13 +234,12 @@ def handle_shape(shape, state: AppState, link: SerialLink):
     if mode == "AUTO":
         if shape == "TWO":
             state.mode = "NORMAL"
-            link.send(b"I")
+            link.send(build_packet(CMD_AUTO_OFF))
             return "AUTO_MODE_EXIT"
         # Everything else is locked out while in Auto mode
         return None
 
     return None
-
 
 def main():
     parser = argparse.ArgumentParser()

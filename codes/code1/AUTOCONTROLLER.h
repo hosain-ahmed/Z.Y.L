@@ -18,11 +18,11 @@ class AutoController : public SmartDevice {
       digitalWrite(pin, LOW);
     }
 
-    void handleCommand(char cmd) override {
-      if (cmd == 'H') {
+    void handleCommand(uint8_t cmdId, uint8_t payload) override {
+      if (cmdId == 0x03) { // CMD_AUTO_ON
         currentLightMode = LightMode::AUTO;
         digitalWrite(pin, HIGH);
-      } else if (cmd == 'I') {
+      } else if (cmdId == 0x04) { // CMD_AUTO_OFF
         currentLightMode = LightMode::MANUAL;
         digitalWrite(pin, LOW);
       }

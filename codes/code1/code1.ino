@@ -7,11 +7,13 @@
 #include "OLEDDISPLAY.h"
 #include "LIGHTMODE.h"
 #include "AUTOCONTROLLER.h"
+#include "PROTOCOLPARSER.h"
 
 
 // Initialize OLED globally so OledDisplay.h can access it
 U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
 LightMode currentLightMode = LightMode::MANUAL; 
+ProtocolParser parser;
 // Create device instances
 Bulb bulb1(13, "Bulb 1"); // true = low-level trigger relay
 Bulb bulb2(14, "Bulb 2");
@@ -34,16 +36,19 @@ void setup() {
   u8g2.sendBuffer();
 }
 
+
+
 void loop() {
-  // 1. Listen and route commands
-  if (Serial.available()) {
-    char cmd = Serial.read();
-    for (int i = 0; i < NUM_DEVICES; i++) {
-      devices[i]->handleCommand(cmd);
+  while (Serial.available()) {
+    Command cmd;
+    if (parser.feed(Serial.read(), cmd)) {
+      // dispatch cmd.cmdId + cmd.payload to devices
+      for (int i = 0; i < NUM_DEVICES; i++) {
+        devices[i]->handleCommand(cmd.cmdId, cmd.payload);
+      }
     }
   }
 
-  // 2. Update background tasks (like drawing video frames)
   for (int i = 0; i < NUM_DEVICES; i++) {
     devices[i]->update();
   }
