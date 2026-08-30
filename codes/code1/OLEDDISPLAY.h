@@ -8,41 +8,76 @@
 
 extern U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2;
 
-enum class TVState { OFF, MENU, PLAYING, PAUSED };
+enum class TVState { OFF, MENU, PLAYING, PAUSED, DOWNLOADING };
 
 class OledDisplay : public SmartDevice {
   private:
     TVState state;
     File vidFile;
-    int currentVideo;          // 1 or 2, hardcoded for now
     const char* name;
 
-    // Hardware input
     int potPin;
     int btnPin;
     bool lastBtnState;
     unsigned long lastBtnTime;
 
-    // Hardcoded video list (menu display names) — replace with real list in Step 4
-    static const int NUM_VIDEOS = 2;
-    const char* videoNames[NUM_VIDEOS] = { "Video 1", "Video 2" };
+    static const int MAX_VIDEOS = 10;
+    String videoList[MAX_VIDEOS];
+    int totalVideos;
+
+    // Cross-core download request — Core 1 sets this, Core 0 polls it.
+    volatile bool downloadRequested;
+    String pendingFilename;
+    String currentFilename;
+    int currentIndex;
+
+    // --- ADDED CACHE TRACKERS ---
+    String slot1 = ""; // Newest/currently playing video
+    String slot2 = ""; // Older cached video
 
   public:
     OledDisplay(const char* deviceName, int potentiometerPin, int buttonPin) {
       name = deviceName;
       state = TVState::OFF;
-      currentVideo = 1;
       potPin = potentiometerPin;
       btnPin = buttonPin;
       lastBtnState = HIGH;
       lastBtnTime = 0;
-
+      totalVideos = 0;
+      currentIndex = 0;
+      downloadRequested = false;
       pinMode(btnPin, INPUT_PULLUP);
+    }
+
+    // Called by core0Task (with Core1 suspended) when a sync packet arrives
+    void addVideoToList(const String &videoName) {
+      if (totalVideos < MAX_VIDEOS) {
+        videoList[totalVideos] = videoName;
+        totalVideos++;
+      }
+    }
+
+    // Polled by core0Task's main loop every iteration
+    bool isDownloadRequested() { return downloadRequested; }
+    String getPendingFilename() { return pendingFilename; }
+
+    // Called by core0Task once the file has been fully written (Core1 still suspended)
+    void onDownloadComplete(const String &filename) {
+      downloadRequested = false;
+      currentFilename = filename;
+      openCurrentVideo();
+      state = TVState::PLAYING;
+    }
+
+    void onDownloadFailed() {
+      downloadRequested = false;
+      state = TVState::MENU;
+      showMessage("DOWNLOAD FAILED");
     }
 
     void handleCommand(uint8_t cmdId, uint8_t payload) override {
       switch (cmdId) {
-        case 0x05: // CMD_TV_ON -> go to menu, not straight to playing
+        case 0x05: // CMD_TV_ON
           state = TVState::MENU;
           break;
         case 0x06: // CMD_TV_OFF
@@ -57,13 +92,10 @@ class OledDisplay : public SmartDevice {
           if (state == TVState::PLAYING) state = TVState::PAUSED;
           break;
         case 0x09: // CMD_TV_NEXT
+          gestureSkip(1);
+          break;
         case 0x0A: // CMD_TV_PREV
-          // Quick-switch while already playing/paused (legacy gesture shortcut)
-          if (state == TVState::PLAYING || state == TVState::PAUSED) {
-            currentVideo = (currentVideo == 1) ? 2 : 1;
-            openCurrentVideo();
-            state = TVState::PLAYING;
-          }
+          gestureSkip(-1);
           break;
       }
     }
@@ -75,10 +107,13 @@ class OledDisplay : public SmartDevice {
           break;
         case TVState::PLAYING:
           checkExitButton();
-          if (state == TVState::PLAYING) streamFrame();  // may have changed to MENU above
+          if (state == TVState::PLAYING) streamFrame();
+          break;
+        case TVState::DOWNLOADING:
+          // Intentionally do nothing — "DOWNLOADING..." stays on screen
           break;
         default:
-          break; // OFF, PAUSED -> render nothing new
+          break;
       }
     }
 
@@ -86,27 +121,80 @@ class OledDisplay : public SmartDevice {
 
   private:
     void runMenu() {
-      int potVal = analogRead(potPin); // 0-4095 on ESP32 ADC
-      int selectedIdx = map(potVal, 0, 4095, 0, NUM_VIDEOS - 1);
+      if (totalVideos == 0) {
+        showMessage("AWAITING PC SYNC");
+        return;
+      }
+
+      int potVal = analogRead(potPin);
+      int selectedIdx = map(potVal, 0, 4095, 0, totalVideos - 1);
       if (selectedIdx < 0) selectedIdx = 0;
-      if (selectedIdx >= NUM_VIDEOS) selectedIdx = NUM_VIDEOS - 1;
+      if (selectedIdx >= totalVideos) selectedIdx = totalVideos - 1;
 
       u8g2.clearBuffer();
       u8g2.setFont(u8g2_font_ncenB08_tr);
       u8g2.drawStr(10, 15, "-- SELECT VIDEO --");
       u8g2.setCursor(10, 40);
       u8g2.print("> ");
-      u8g2.print(videoNames[selectedIdx]);
+      u8g2.print(videoList[selectedIdx]);
       u8g2.sendBuffer();
 
       bool currentBtn = digitalRead(btnPin);
       if (currentBtn == LOW && lastBtnState == HIGH && millis() - lastBtnTime > 250) {
         lastBtnTime = millis();
-        currentVideo = selectedIdx + 1;  // videoNames[0] -> video1.bin, etc.
-        openCurrentVideo();
-        state = TVState::PLAYING;
+        currentIndex = selectedIdx;
+        selectVideo(videoList[selectedIdx]);
       }
       lastBtnState = currentBtn;
+    }
+
+    // Gesture-driven next/prev
+    void gestureSkip(int direction) {
+      if (totalVideos == 0) return;
+      currentIndex = (currentIndex + direction + totalVideos) % totalVideos;
+      selectVideo(videoList[currentIndex]);
+    }
+
+    // --- CACHE MANAGEMENT: Automatically delete older videos to save space ---
+    void makeSpaceFor(String newFilename) {
+      if (slot1 == newFilename) return; // Already newest, do nothing
+      
+      if (slot2 == newFilename) {
+        // Playing the older file again, swap order
+        slot2 = slot1;
+        slot1 = newFilename;
+        return;
+      }
+
+      // Brand new file. Delete the oldest one (slot2) from flash
+      if (slot2 != "") {
+        String pathToEvict = "/" + slot2;
+        if (LittleFS.exists(pathToEvict)) {
+          LittleFS.remove(pathToEvict);
+          Serial.println("EVICTED: " + pathToEvict);
+        }
+      }
+
+      // Shift history down
+      slot2 = slot1;
+      slot1 = newFilename;
+    }
+
+    void selectVideo(const String &targetName) {
+      // 1. Clear space before doing anything else!
+      makeSpaceFor(targetName); 
+      
+      String path = "/" + targetName;
+      if (LittleFS.exists(path)) {
+        currentFilename = targetName;
+        openCurrentVideo();
+        state = TVState::PLAYING;
+      } else {
+        state = TVState::DOWNLOADING;
+        showMessage("DOWNLOADING...");
+        pendingFilename = targetName;
+        downloadRequested = true;  // core0Task will notice this and take over
+      }
     }
 
     void checkExitButton() {
@@ -121,28 +209,22 @@ class OledDisplay : public SmartDevice {
 
     void openCurrentVideo() {
       if (vidFile) vidFile.close();
-      String path = "/video" + String(currentVideo) + ".bin";
+      String path = "/" + currentFilename;
       vidFile = LittleFS.open(path, "r");
-      if (!vidFile) {
-        showMessage("FILE OPEN FAIL");
-      }
+      if (!vidFile) showMessage("FILE OPEN FAIL");
     }
 
     void streamFrame() {
       if (!vidFile) return;
-
       static uint8_t frameBuffer[1024];
       size_t bytesRead = vidFile.read(frameBuffer, 1024);
-
+      
       if (bytesRead < 1024) {
-        vidFile.seek(0);
+        vidFile.seek(0); // loop to beginning
         bytesRead = vidFile.read(frameBuffer, 1024);
-        if (bytesRead < 1024) {
-          showMessage("FRAME READ FAIL");
-          return;
-        }
+        if (bytesRead < 1024) { showMessage("FRAME READ FAIL"); return; }
       }
-
+      
       u8g2.clearBuffer();
       u8g2.setDrawColor(1);
       u8g2.drawXBM(0, 0, 128, 64, frameBuffer);
@@ -153,7 +235,7 @@ class OledDisplay : public SmartDevice {
       u8g2.clearBuffer();
       u8g2.setDrawColor(1);
       u8g2.setFont(u8g2_font_ncenB08_tr);
-      u8g2.drawStr(15, 35, msg);
+      u8g2.drawStr(10, 35, msg);
       u8g2.sendBuffer();
     }
 };

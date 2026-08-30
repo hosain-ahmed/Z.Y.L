@@ -10,5 +10,17 @@
     "filename": "video2.bin",
     "frame_count": 500,
     "fps_source": 30.0
+  },
+  {
+    "name": "Bakugo",
+    "filename": "video3.bin",
+    "frame_count": 409,
+    "fps_source": 30.0
+  },
+  {
+    "name": "Izuku",
+    "filename": "video4.bin",
+    "frame_count": 500,
+    "fps_source": 30.0
   }
 ]

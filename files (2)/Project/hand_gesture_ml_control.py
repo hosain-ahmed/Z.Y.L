@@ -1,58 +1,17 @@
 """
 hand_gesture_ml_control.py
 =============================
-Implements the gesture table:
-
-    Gesture     | Normal Mode                    | TV Mode
-    ------------|---------------------------------|------------------
-    Open palm   | Bulb 1 toggle                  | Play
-    Fist        | Bulb 2 toggle                  | Pause
-    Thumbs up   | Fan ON / speed up              | Skip forward (next channel)
-    Thumbs down | Fan OFF / speed down           | Skip back (prev channel)
-    Peace (TWO) | Auto/occupancy mode toggle      | -- (inactive)
-    OK sign     | Toggle TV Mode (enter)          | Toggle TV Mode (exit)
-
-THREE MODES:
-    NORMAL - manual bulb/fan control (default)
-    TV     - Open palm/Fist/Thumbs up/down control a small animation
-             "playing" on an OLED screen wired to the ESP32 (looks like
-             a mini TV). Enter/exit via OK sign.
-    AUTO   - entered via Peace sign from NORMAL. Forces Bulb1, Bulb2, and
-             Fan OFF immediately and LOCKS manual gesture control (no PIR
-             sensor - this is a pure "everything off" lockout mode).
-             Exit back to NORMAL via Peace sign again.
-
-SERIAL PROTOCOL (single byte, sent to ESP32):
-    'A' -> Bulb 1 toggle
-    'B' -> Bulb 2 toggle
-    'C' -> Fan speed up (turns on / increases one step, caps at max)
-    'D' -> Fan speed down (decreases one step / turns off at zero)
-    'H' -> Auto mode ENTER  (ESP32 forces bulb1/bulb2/fan off, lights
-                              its onboard "Auto" indicator LED)
-    'I' -> Auto mode EXIT   (turns the indicator LED back off)
-    'J' -> TV mode ENTER (turns OLED on, starts Channel 1 playing)
-    'K' -> TV mode EXIT  (turns OLED off / blank screen)
-    'P' -> TV Play  (resume animation)
-    'Q' -> TV Pause (freeze current frame)
-    'N' -> TV Skip forward (next channel)
-    'M' -> TV Skip back (previous channel)
-
-Requirements:
-    pip install opencv-python mediapipe scikit-learn joblib pyserial
-
-Run collect_gesture_data.py and train_gesture_model.py first (with the
-NEW 6-class scheme) so that gesture_model.pkl exists.
-
-Usage:
-    python hand_gesture_ml_control.py --port COM5
-    python hand_gesture_ml_control.py --no-serial   (test without ESP32)
+Implements the gesture table and background video downloads via threading.
 """
 
 import argparse
 import os
 import time
-import urllib.request
+import struct
+import json
+import threading
 from collections import deque, Counter
+import urllib.request
 
 import cv2
 import joblib
@@ -65,9 +24,9 @@ try:
 except ImportError:
     serial = None
 
-# ----------------------------------------------------------------------
-# Shared config (previously in gesture_utils.py, now inlined here)
-# ----------------------------------------------------------------------
+VIDEO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "encoded_videos")
+MANIFEST_PATH = os.path.join(VIDEO_DIR, "manifest.json")
+
 MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 HAND_MODEL_PATH = os.path.join(SCRIPT_DIR, "hand_landmarker.task")
@@ -82,19 +41,12 @@ def ensure_hand_model():
 
 
 def normalize_landmarks(landmarks_xy):
-    """
-    landmarks_xy: list of 21 (x, y) tuples (normalized image coords, 0-1).
-    Returns a flat list of 42 floats, relative to the wrist and scaled
-    by the largest coordinate (distance/position invariant).
-    """
     wrist_x, wrist_y = landmarks_xy[0]
     relative = [(x - wrist_x, y - wrist_y) for (x, y) in landmarks_xy]
-
     flat = []
     for x, y in relative:
         flat.append(x)
         flat.append(y)
-
     max_val = max(abs(v) for v in flat) or 1.0
     return [v / max_val for v in flat]
 
@@ -114,13 +66,11 @@ WINDOW_SIZE = 10
 MIN_VOTES = 8
 MIN_COOLDOWN_SEC = 1.2
 MIN_CONFIDENCE = 0.6
-
 FAN_MAX_LEVEL = 3
 
 START_BYTE = 0xAA
 END_BYTE = 0xBB
 
-# Map your existing gesture->char logic to a byte identifier and default payload
 CMD_BULB1_TOGGLE = 0x01
 CMD_BULB2_TOGGLE = 0x02
 CMD_AUTO_ON      = 0x03
@@ -131,11 +81,102 @@ CMD_TV_PLAY      = 0x07
 CMD_TV_PAUSE     = 0x08
 CMD_TV_NEXT      = 0x09
 CMD_TV_PREV      = 0x0A
-CMD_FAN_SPEED    = 0x0B  # payload = 0-255 speed value
+CMD_FAN_SPEED    = 0x0B
+
 
 def build_packet(cmd_id: int, payload: int = 0) -> bytes:
     return bytes([START_BYTE, cmd_id, payload & 0xFF, END_BYTE])
 
+
+def sync_video_manifest(link):
+    if not link.enabled or not link.conn:
+        return
+    if not os.path.exists(MANIFEST_PATH):
+        print(f"[Library] No manifest found at {MANIFEST_PATH} — skipping sync.")
+        return
+    with open(MANIFEST_PATH, 'r') as f:
+        manifest = json.load(f)
+    print(f"[Library] Syncing {len(manifest)} videos to ESP32...")
+    for entry in manifest:
+        link.conn.write(bytes([START_BYTE, 0x11, 0x00, END_BYTE]))
+        link.conn.write(f"{entry['filename']}\n".encode())
+        time.sleep(0.1)
+    print("[Library] Sync complete.")
+
+
+def serve_fetch_request_threaded(link, filename, state):
+    """Runs in a background thread to prevent webcam freezing.
+    state.is_downloading is set by the CALLER before this thread starts —
+    do not set it here, that would leave a race window open."""
+    state.download_progress = 0.0
+
+    filepath = os.path.join(VIDEO_DIR, filename)
+    print(f"\n[REQUEST] ESP32 wants: {filename}")
+
+    if not os.path.exists(filepath):
+        print(f"[ERROR] {filepath} not found locally.")
+        state.is_downloading = False
+        return
+
+    conn = link.conn
+    conn.write(bytes([START_BYTE, 0x10, 0x00, END_BYTE]))
+    conn.write(f"{filename}\n".encode())
+    time.sleep(0.05)
+
+    file_size = os.path.getsize(filepath)
+    conn.write(struct.pack('<I', file_size))
+
+    with open(filepath, 'rb') as f:
+        data = f.read()
+
+    CHUNK_SIZE = 128
+    sent = 0
+    while sent < len(data):
+        chunk = data[sent:sent + CHUNK_SIZE]
+        conn.write(chunk)
+        sent += len(chunk)
+
+        while True:
+            resp = conn.readline().decode(errors='ignore').strip()
+            if not resp:
+                continue
+            if resp == "ACK":
+                break
+            if resp == "TIMEOUT_NO_DATA":
+                conn.write(chunk)
+            else:
+                print(f"[ESP32] {resp}")
+
+        state.download_progress = (sent / len(data)) * 100
+
+    print(f"\n[SUCCESS] {filename} transfer complete.")
+    state.is_downloading = False
+
+
+def check_for_fetch_requests(link, state):
+    """Non-blocking check. Spawns a thread if a file is requested."""
+    if not link.enabled or not link.conn:
+        return
+
+    if state.is_downloading:
+        return
+
+    if link.conn.in_waiting:
+        line = link.conn.readline().decode(errors='ignore').strip()
+        if not line:
+            return
+        if line.startswith("FETCH:"):
+            filename = line.split(":", 1)[1]
+            # Set the flag HERE, synchronously in the main thread, before the
+            # background thread even starts — closes the race window entirely.
+            state.is_downloading = True
+            threading.Thread(
+                target=serve_fetch_request_threaded,
+                args=(link, filename, state),
+                daemon=True
+            ).start()
+        elif line:
+            print(f"[ESP32] {line}")
 
 
 class SerialLink:
@@ -145,11 +186,25 @@ class SerialLink:
         if self.enabled:
             try:
                 self.conn = serial.Serial(port, baud, timeout=1)
-                time.sleep(2)
-                print(f"[Serial] Connected to {port} @ {baud} baud")
+                print(f"[Serial] Connected to {port} @ {baud} baud, waiting for ESP32 boot...")
+                self._wait_for_boot_ready()
             except Exception as e:
                 print(f"[Serial] Could not open {port}: {e}")
                 self.enabled = False
+
+    def _wait_for_boot_ready(self, timeout=15):
+        """Wait for the ESP32 to actually finish setup() (LittleFS mount/format
+        included) instead of guessing a fixed delay — first-time LittleFS format
+        can take longer than a couple seconds and swallow early sync packets."""
+        start = time.time()
+        while time.time() - start < timeout:
+            line = self.conn.readline().decode(errors='ignore').strip()
+            if line:
+                print(f"[ESP32 boot] {line}")
+            if line == "BOOT_READY":
+                print("[Serial] ESP32 confirmed ready.")
+                return
+        print("[Serial] Warning: never saw BOOT_READY — proceeding anyway, sync may fail.")
 
     def send(self, cmd_bytes):
         if self.enabled and self.conn:
@@ -163,19 +218,15 @@ class SerialLink:
 
 class AppState:
     def __init__(self):
-        self.mode = "NORMAL"  # NORMAL, TV, AUTO
+        self.mode = "NORMAL"
         self.bulb1 = False
         self.bulb2 = False
-        self.fan_level = 0  # 0..FAN_MAX_LEVEL
+        self.fan_level = 0
+        self.is_downloading = False
+        self.download_progress = 0.0
 
 
 def handle_shape(shape, state: AppState, link: SerialLink):
-    """
-    Given a recognized shape and the current mode, performs the
-    corresponding action (serial command / media key / mode switch) and
-    returns a short label for logging, or None if the shape does nothing
-    in the current mode.
-    """
     mode = state.mode
 
     if mode == "NORMAL":
@@ -189,7 +240,6 @@ def handle_shape(shape, state: AppState, link: SerialLink):
             return "BULB2_TOGGLE"
         if shape == "THUMBS_UP":
             state.fan_level = min(state.fan_level + 1, FAN_MAX_LEVEL)
-            # Map 0-3 level to 0-255 PWM payload
             pwm_val = int((state.fan_level / FAN_MAX_LEVEL) * 255)
             link.send(build_packet(CMD_FAN_SPEED, pwm_val))
             return f"FAN_UP (level {state.fan_level})"
@@ -228,7 +278,6 @@ def handle_shape(shape, state: AppState, link: SerialLink):
             state.mode = "NORMAL"
             link.send(build_packet(CMD_TV_OFF))
             return "TV_MODE_EXIT"
-        # TWO (peace sign) is inactive in TV mode per the gesture table
         return None
 
     if mode == "AUTO":
@@ -236,20 +285,21 @@ def handle_shape(shape, state: AppState, link: SerialLink):
             state.mode = "NORMAL"
             link.send(build_packet(CMD_AUTO_OFF))
             return "AUTO_MODE_EXIT"
-        # Everything else is locked out while in Auto mode
         return None
 
     return None
 
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--port", default=None, help="ESP32 serial port, e.g. COM5 or /dev/ttyUSB0")
+    parser.add_argument("--port", default=None, help="ESP32 serial port, e.g. COM5")
     parser.add_argument("--baud", type=int, default=115200)
     parser.add_argument("--no-serial", action="store_true")
     parser.add_argument("--camera", type=int, default=0)
     args = parser.parse_args()
 
     link = SerialLink(args.port, args.baud, enabled=not args.no_serial)
+    sync_video_manifest(link)
 
     ensure_hand_model()
 
@@ -283,6 +333,8 @@ def main():
 
     with HandLandmarker.create_from_options(options) as landmarker:
         while True:
+            check_for_fetch_requests(link, state)
+
             ok, frame = cap.read()
             if not ok:
                 print("Error: failed to read frame from webcam.")
@@ -337,13 +389,13 @@ def main():
 
             if (stable_shape and stable_shape != last_fired_shape
                     and (now - last_fire_time) > MIN_COOLDOWN_SEC):
-                result_label = handle_shape(stable_shape, state, link)
-                if result_label:
-                    print(f"[{state.mode}] {result_label}")
-                    last_fired_shape = stable_shape
-                    last_fire_time = now
+                if not state.is_downloading:
+                    result_label = handle_shape(stable_shape, state, link)
+                    if result_label:
+                        print(f"[{state.mode}] {result_label}")
+                        last_fired_shape = stable_shape
+                        last_fire_time = now
 
-            # --- On-screen display ---
             cv2.putText(frame, f"Mode: {state.mode}", (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 200, 0), 2)
             if state.mode == "NORMAL":
@@ -357,6 +409,10 @@ def main():
             if stable_shape:
                 cv2.putText(frame, f"Stable: {stable_shape}", (10, 120),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
+
+            if state.is_downloading:
+                cv2.putText(frame, f"DOWNLOADING TO TV: {state.download_progress:.1f}%", (10, 150),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
             cv2.imshow("Gesture Control", frame)
 
