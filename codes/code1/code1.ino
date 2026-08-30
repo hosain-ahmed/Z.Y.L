@@ -1,5 +1,7 @@
 #include <Wire.h>
 #include <U8g2lib.h>
+#include <LittleFS.h>  // <-- ADDED: Include the LittleFS library
+
 #include "SMARTDEVICE.h"
 #include "BULB.h"
 #include "FAN.h"
@@ -8,7 +10,6 @@
 #include "AUTOCONTROLLER.h"
 #include "PROTOCOLPARSER.h"
 #include "OLEDCOMMAND.h"
-
 
 U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
 LightMode currentLightMode = LightMode::MANUAL;
@@ -70,6 +71,11 @@ void setup() {
   Serial.begin(115200);
   u8g2.begin();
   u8g2.setBusClock(400000);
+
+  // <-- ADDED: Mount LittleFS before starting your FreeRTOS tasks
+  if (!LittleFS.begin(true)) {
+    Serial.println("LittleFS mount failed!");
+  }
 
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_ncenB08_tr);

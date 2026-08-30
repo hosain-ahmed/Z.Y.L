@@ -31,10 +31,10 @@ void setup() {
   uint32_t fileSize = sizeBytes[0] | (sizeBytes[1] << 8) | (sizeBytes[2] << 16) | (sizeBytes[3] << 24);
   Serial.printf("Expecting %lu bytes...\n", fileSize);
 
-  // --- Write incoming bytes to /test.bin ---
-  File f = LittleFS.open("/test.bin", "w");
+  // --- Write incoming bytes to /video1.bin ---
+  File f = LittleFS.open("/video1.bin", "w");
   if (!f) {
-    Serial.println("Failed to open /test.bin for writing.");
+    Serial.println("Failed to open /video1.bin for writing.");
     showMessage("OPEN WRITE FAIL");
     while (true) delay(1000);
   }
@@ -59,7 +59,7 @@ void setup() {
   delay(1000);
 
   // --- Now read it back and confirm size matches ---
-  File check = LittleFS.open("/test.bin", "r");
+  File check = LittleFS.open("/video1.bin", "r");
   Serial.printf("Read-back file size: %d bytes (expected %lu)\n", check.size(), fileSize);
   check.close();
 }
@@ -70,7 +70,7 @@ void loop() {
   static bool opened = false;
 
   if (!opened) {
-    vidFile = LittleFS.open("/test.bin", "r");
+    vidFile = LittleFS.open("/video1.bin", "r");
     if (!vidFile) {
       showMessage("PLAYBACK OPEN FAIL");
       delay(2000);

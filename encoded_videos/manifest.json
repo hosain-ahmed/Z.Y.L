@@ -4,5 +4,11 @@
     "filename": "video1.bin",
     "frame_count": 500,
     "fps_source": 23.98
+  },
+  {
+    "name": "BadApple",
+    "filename": "video2.bin",
+    "frame_count": 500,
+    "fps_source": 30.0
   }
 ]

@@ -7,7 +7,7 @@ import os
 # --- CONFIGURATION ---
 MAX_FRAMES_ALLOWED = 500          # hardware/flash cap per video
 PROCESS_MODE = 'dither'           # 'dither', 'edge', or 'threshold'
-OUTPUT_DIR = 'encoded_videos'     # where .bin files + manifest live
+OUTPUT_DIR = r'Q:\GestureControlledSystem\encoded_videos'
 MANIFEST_PATH = os.path.join(OUTPUT_DIR, 'manifest.json')
 
 

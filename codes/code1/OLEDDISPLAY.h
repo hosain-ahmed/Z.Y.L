@@ -3,9 +3,8 @@
 
 #include <Arduino.h>
 #include <U8g2lib.h>
+#include <LittleFS.h>
 #include "SMARTDEVICE.h"
-#include "videoframe900.h" 
-#include "videoframe2.h"
 
 extern U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2;
 
@@ -14,8 +13,8 @@ enum class TVState { OFF, PLAYING, PAUSED };
 class OledDisplay : public SmartDevice {
   private:
     TVState state;
-    int currentVideo;
-    int currentFrame;
+    File vidFile;
+    int currentVideo;      // 1 or 2 for now, hardcoded filenames
     const char* name;
 
   public:
@@ -23,16 +22,17 @@ class OledDisplay : public SmartDevice {
       name = deviceName;
       state = TVState::OFF;
       currentVideo = 1;
-      currentFrame = 0;
     }
 
     void handleCommand(uint8_t cmdId, uint8_t payload) override {
       switch (cmdId) {
         case 0x05: // CMD_TV_ON
+          openCurrentVideo();
           state = TVState::PLAYING;
           break;
         case 0x06: // CMD_TV_OFF
           state = TVState::OFF;
+          if (vidFile) vidFile.close();
           showMessage("TV OFF");
           break;
         case 0x07: // CMD_TV_PLAY
@@ -45,7 +45,7 @@ class OledDisplay : public SmartDevice {
         case 0x0A: // CMD_TV_PREV
           if (state != TVState::OFF) {
             currentVideo = (currentVideo == 1) ? 2 : 1;
-            currentFrame = 0;
+            openCurrentVideo();
             state = TVState::PLAYING;
           }
           break;
@@ -53,25 +53,40 @@ class OledDisplay : public SmartDevice {
     }
 
     void update() override {
-      if (state != TVState::PLAYING) return;  // only render when actively playing
+      if (state != TVState::PLAYING) return;
+      if (!vidFile) return;
+
+      static uint8_t frameBuffer[1024];
+      size_t bytesRead = vidFile.read(frameBuffer, 1024);
+
+      if (bytesRead < 1024) {
+        // reached end of file — loop back to the start
+        vidFile.seek(0);
+        bytesRead = vidFile.read(frameBuffer, 1024);
+        if (bytesRead < 1024) {
+          showMessage("FRAME READ FAIL");
+          return;
+        }
+      }
 
       u8g2.clearBuffer();
       u8g2.setDrawColor(1);
-
-      if (currentVideo == 1) {
-        u8g2.drawXBM(0, 0, 128, 64, video_frames[currentFrame]);
-        currentFrame = (currentFrame + 1) % TOTAL_FRAMES;
-      } else {
-        u8g2.drawXBM(0, 0, 128, 64, video_frames2[currentFrame]);
-        currentFrame = (currentFrame + 1) % TOTAL_FRAMES_2;
-      }
-
+      u8g2.drawXBM(0, 0, 128, 64, frameBuffer);
       u8g2.sendBuffer();
     }
 
     const char* getName() override { return name; }
 
   private:
+    void openCurrentVideo() {
+      if (vidFile) vidFile.close();
+      String path = "/video" + String(currentVideo) + ".bin";
+      vidFile = LittleFS.open(path, "r");
+      if (!vidFile) {
+        showMessage("FILE OPEN FAIL");
+      }
+    }
+
     void showMessage(const char* msg) {
       u8g2.clearBuffer();
       u8g2.setDrawColor(1);
