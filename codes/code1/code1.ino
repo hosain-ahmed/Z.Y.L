@@ -55,7 +55,7 @@ void core0Task(void *param) {
 
 // ---------- Core 1 task: owns OledDisplay entirely ----------
 void oledTask(void *param) {
-  OledDisplay miniTV("Mini TV");
+  OledDisplay miniTV("Mini TV", 34, 32);
 
   for (;;) {
     OledCommand oc;
